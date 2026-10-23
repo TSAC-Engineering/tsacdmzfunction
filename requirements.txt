@@ -8,3 +8,4 @@ azure.data.tables
 azure.core
 azure.functions
 datetime 
+msal
