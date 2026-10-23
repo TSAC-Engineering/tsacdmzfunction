@@ -158,7 +158,7 @@ class StorageAccount(object):
                 logger.info(Response)
 
             except:
-                Message = "Connection Error: Unable to connect to " + Blob_ServiceClient.url
+                Message = "Connection Error: Unable to connect to " + Blob_ServiceClient.url # type: ignore
                 Response = {'Code': 500, 'Message': Message}
                 logger.critical(Response)
 
@@ -281,7 +281,7 @@ class StorageAccount(object):
             
             
                 try:
-                    Blob_FileDirectoryClient_Download = Blob_FileDirectoryClient.download_blob() 
+                    Blob_FileDirectoryClient_Download = Blob_FileDirectoryClient.download_blob()  # type: ignore
                     logger.info("Successfully downloaded " + Blob_FileDirectoryName + " in " + Blob_ContainerName)
 
                     
@@ -301,7 +301,7 @@ class StorageAccount(object):
                 
                 try:
                     with open(file=FilePath, mode = "wb") as File:
-                        File.write(Blob_FileDirectoryClient_Download.readall())
+                        File.write(Blob_FileDirectoryClient_Download.readall()) # type: ignore
                     Message = "Created: File " + FilePath + " was successfully created!"
                     Response = {'Code': 201, 'Message': Message}
                     logger.info(Response)
@@ -363,7 +363,7 @@ class StorageAccount(object):
                     expiry_time = datetime.utcnow() + timedelta(minutes=15)
 
                     sas_token = generate_blob_sas(
-                    account_name=Blob_ServiceClient_Origin.account_name,
+                    account_name=Blob_ServiceClient_Origin.account_name, # type: ignore
                     container_name=Blob_ContainerName_Origin,
                     blob_name=Blob_FileDirectoryName_Origin,
                     account_key=Blob_AccountKey_Origin,
@@ -448,9 +448,9 @@ class StorageAccount(object):
             except: 
                 Message = "Not Implemented: Unable to successfully change the blob tier to " + BlobTier + "."
                 Response = {'Code': 501, 'Message': Message}
-                logger.Error(Response)
+                logger.Error(Response) # type: ignore
 
-            ResponseCode = Response['Code']
+            ResponseCode = Response['Code'] # type: ignore
             Trials = Trials + 1
 
         return Response

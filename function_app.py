@@ -1,8 +1,8 @@
-
 import logging
 import json
 import os
-from urllib.parse import quote
+import re
+from urllib.parse import quote, unquote, urlparse
 
 import azure.functions as func
 import AzureStorageAccount
@@ -10,6 +10,7 @@ import msal
 import requests
 
 from azure.storage.blob import BlobServiceClient
+from azure.core import MatchConditions
 
 
 app = func.FunctionApp()
@@ -30,12 +31,15 @@ AntimalwareScanEventType = "Microsoft.Security.MalwareScanningResult"
 MaliciousVerdict = "Malicious"
 CleanVerdict = "No threats found"
 
+GRAPH_BASE = "https://graph.microsoft.com/v1.0"
+
 
 # ============================================================
 # MICROSOFT GRAPH AUTHENTICATION
 # ============================================================
 
-def get_graph_token():
+def get_graph_token() -> str:
+
     tenant_id = os.environ["SHAREPOINT_TENANT_ID"]
     client_id = os.environ["SHAREPOINT_CLIENT_ID"]
     client_secret = os.environ["SHAREPOINT_CLIENT_SECRET"]
@@ -50,38 +54,307 @@ def get_graph_token():
         scopes=["https://graph.microsoft.com/.default"]
     )
 
-    token = result.get("access_token") # type: ignore
+    if result is None:
+        raise RuntimeError(
+            "Microsoft Graph authentication returned no response."
+        )
+
+    token = result.get("access_token")
 
     if not isinstance(token, str) or not token:
+        error_message = result.get(
+            "error_description",
+            result.get("error", "Unknown authentication error")
+        )
+
         raise RuntimeError(
-            "Microsoft Graph authentication failed: "
-            + str(result.get("error_description", result.get("error"))) # type: ignore
+            f"Microsoft Graph authentication failed: {error_message}"
         )
 
     return token
 
 
 # ============================================================
+# RESOLVE SHAREPOINT DOCUMENT LIBRARY
+# ============================================================
+
+def get_sharepoint_drive_id(token: str) -> str:
+    """
+    Resolve SharePoint site and document library
+    using environment variables.
+
+    SHAREPOINT_SITE_URL:
+        https://tsacengineering.sharepoint.com/sites/SurveyTeamTest
+
+    SHAREPOINT_LIBRARY_NAME:
+        Survey Submissions
+    """
+
+    parsed_url = urlparse(
+        os.environ["SHAREPOINT_SITE_URL"]
+    )
+
+    if (
+        parsed_url.scheme != "https"
+        or not parsed_url.hostname
+        or not parsed_url.path.strip("/")
+    ):
+        raise ValueError("Invalid SHAREPOINT_SITE_URL")
+
+    hostname = parsed_url.hostname
+    site_path = parsed_url.path.rstrip("/")
+    library_name = os.environ["SHAREPOINT_LIBRARY_NAME"]
+
+    headers = {
+        "Authorization": f"Bearer {token}"
+    }
+
+    # --------------------------------------------------------
+    # RESOLVE SITE ID
+    # --------------------------------------------------------
+
+    site_url = (
+        f"{GRAPH_BASE}/sites/"
+        f"{hostname}:{quote(site_path, safe='/')}"
+    )
+
+    response = requests.get(
+        site_url,
+        headers=headers,
+        timeout=30
+    )
+
+    response.raise_for_status()
+
+    site_id = response.json()["id"]
+
+    logging.info(
+        "Resolved SharePoint site: %s",
+        site_id
+    )
+
+    # --------------------------------------------------------
+    # RESOLVE DOCUMENT LIBRARY
+    # --------------------------------------------------------
+
+    drives_url = f"{GRAPH_BASE}/sites/{site_id}/drives"
+
+    while drives_url:
+
+        response = requests.get(
+            drives_url,
+            headers=headers,
+            timeout=30
+        )
+
+        response.raise_for_status()
+
+        data = response.json()
+
+        for drive in data.get("value", []):
+
+            if (
+                drive.get("name", "").casefold()
+                == library_name.casefold()
+            ):
+
+                logging.info(
+                    "Resolved SharePoint library: %s",
+                    drive["name"]
+                )
+
+                return drive["id"]
+
+        drives_url = data.get("@odata.nextLink")
+
+    raise RuntimeError(
+        f"SharePoint library '{library_name}' "
+        f"not found at {hostname}{site_path}"
+    )
+
+
+# ============================================================
+# SHAREPOINT FOLDER NAME VALIDATION
+# ============================================================
+
+def safe_folder(value: str) -> str:
+    """
+    Converts a metadata value into a valid
+    SharePoint folder name.
+    """
+
+    value = str(value).strip()
+
+    value = re.sub(
+        r'["*:<>?/\\|]',
+        "_",
+        value
+    )
+
+    value = value.strip(" .")
+
+    if not value:
+        raise ValueError(
+            "SharePoint folder name cannot be empty"
+        )
+
+    return value
+
+
+# ============================================================
+# SHAREPOINT FOLDER CREATION
+# ============================================================
+
+def ensure_sharepoint_folder(
+    drive_id: str,
+    parent_id: str,
+    folder_name: str,
+    token: str
+) -> str:
+    """
+    Returns an existing SharePoint folder ID or
+    creates the folder if it does not exist.
+    """
+
+    headers = {
+        "Authorization": f"Bearer {token}",
+        "Content-Type": "application/json"
+    }
+
+    encoded_name = quote(folder_name, safe="")
+
+    if parent_id == "root":
+
+        check_url = (
+            f"{GRAPH_BASE}/drives/{drive_id}"
+            f"/root:/{encoded_name}"
+        )
+
+        create_url = (
+            f"{GRAPH_BASE}/drives/{drive_id}/root/children"
+        )
+
+    else:
+
+        check_url = (
+            f"{GRAPH_BASE}/drives/{drive_id}"
+            f"/items/{parent_id}:/{encoded_name}"
+        )
+
+        create_url = (
+            f"{GRAPH_BASE}/drives/{drive_id}"
+            f"/items/{parent_id}/children"
+        )
+
+    # --------------------------------------------------------
+    # CHECK EXISTING FOLDER
+    # --------------------------------------------------------
+
+    response = requests.get(
+        check_url,
+        headers=headers,
+        timeout=30
+    )
+
+    if response.status_code == 200:
+
+        item = response.json()
+
+        if "folder" not in item:
+            raise RuntimeError(
+                f"SharePoint item exists but is not "
+                f"a folder: {folder_name}"
+            )
+
+        return item["id"]
+
+    if response.status_code != 404:
+        response.raise_for_status()
+
+    # --------------------------------------------------------
+    # CREATE FOLDER
+    # --------------------------------------------------------
+
+    payload = {
+        "name": folder_name,
+        "folder": {},
+        "@microsoft.graph.conflictBehavior": "fail"
+    }
+
+    response = requests.post(
+        create_url,
+        headers=headers,
+        json=payload,
+        timeout=30
+    )
+
+    if response.status_code == 409:
+
+        # Folder may have been created by another invocation
+        response = requests.get(
+            check_url,
+            headers=headers,
+            timeout=30
+        )
+
+    response.raise_for_status()
+
+    item = response.json()
+
+    if "folder" not in item:
+        raise RuntimeError(
+            f"SharePoint item is not a folder: {folder_name}"
+        )
+
+    logging.info(
+        "SharePoint folder ready: %s",
+        folder_name
+    )
+
+    return item["id"]
+
+
+# ============================================================
 # SHAREPOINT UPLOAD
 # ============================================================
 
-def upload_clean_blob_to_sharepoint(blob_name, dmz_credential):
+def upload_clean_blob_to_sharepoint(
+    blob_name: str,
+    dmz_credential: str,
+    expected_etag: str
+) -> dict:
     """
-    Downloads a Defender-approved blob directly from the DMZ
-    and uploads it to the SharePoint document library.
+    Upload a Defender-approved blob directly from DMZ
+    to SharePoint.
 
-    Does not depend on the tsacstorage02 copy.
+    Folder structure:
+        category/
+        project_number/
+        submitter/
+        submission_time/
+        blobname
+
+    Metadata provides the four folder names.
+
+    The actual DMZ blob name provides the filename.
     """
 
-    drive_id = os.environ["SHAREPOINT_DRIVE_ID"]
-    folder = os.environ.get("SHAREPOINT_FOLDER", "").strip("/")
+    # --------------------------------------------------------
+    # RESOLVE SHAREPOINT DESTINATION
+    # --------------------------------------------------------
 
-    logging.info(
-        "Starting SharePoint upload for %s",
-        blob_name
-    )
+    token = get_graph_token()
 
-    # Connect directly to DMZ storage
+    drive_id = get_sharepoint_drive_id(token)
+
+    root_folder = os.environ.get(
+        "SHAREPOINT_FOLDER", ""
+    ).strip("/")
+
+    # --------------------------------------------------------
+    # CONNECT DIRECTLY TO DMZ
+    # --------------------------------------------------------
+
     blob_service_client = BlobServiceClient(
         account_url=DMZ_StorageAccount_URL,
         credential=dmz_credential
@@ -92,29 +365,123 @@ def upload_clean_blob_to_sharepoint(blob_name, dmz_credential):
         blob=blob_name
     )
 
-    # Download the source file
-    file_data = blob_client.download_blob().readall()
+    # --------------------------------------------------------
+    # READ BLOB METADATA
+    # --------------------------------------------------------
 
-    if len(file_data) > 250 * 1024 * 1024:
-        raise ValueError(
-            "File exceeds Microsoft Graph simple upload limit. "
-            "Use an upload session."
+    properties = blob_client.get_blob_properties()
+
+    if properties.etag != expected_etag:
+        raise RuntimeError(
+            f"Blob changed since Defender scan: {blob_name}"
         )
 
-    # Preserve the relative blob path
-    destination_path = (
-        f"{folder}/{blob_name}" if folder else blob_name
+    metadata = properties.metadata or {}
+
+    required_fields = [
+        "category",
+        "project_number",
+        "submitter",
+        "submission_time"
+    ]
+
+    missing_fields = [
+        field
+        for field in required_fields
+        if not metadata.get(field)
+    ]
+
+    if missing_fields:
+        raise ValueError(
+            f"Missing metadata for {blob_name}: "
+            f"{missing_fields}"
+        )
+
+    # --------------------------------------------------------
+    # BUILD FOLDER PATH FROM METADATA
+    # --------------------------------------------------------
+
+    folders = [
+        safe_folder(metadata["category"]),
+        safe_folder(metadata["project_number"]),
+        safe_folder(metadata["submitter"]),
+        safe_folder(metadata["submission_time"])
+    ]
+
+    if root_folder:
+
+        folders = [
+            *[
+                safe_folder(folder)
+                for folder in root_folder.split("/")
+            ],
+            *folders
+        ]
+
+    # The filename is from the DMZ blob name
+    file_name = blob_name.rsplit("/", 1)[-1]
+
+    if not file_name:
+        raise ValueError("DMZ blob filename is empty")
+
+    if (
+        re.search(r'["*:<>?/\\|]', file_name)
+        or file_name.endswith((" ", "."))
+        or file_name in (".", "..")
+    ):
+        raise ValueError(
+            f"Invalid SharePoint filename: {file_name}"
+        )
+
+    logging.info(
+        "SharePoint destination: %s/%s",
+        "/".join(folders),
+        file_name
     )
 
-    encoded_path = quote(destination_path, safe="/")
+    # --------------------------------------------------------
+    # CREATE SHAREPOINT FOLDERS
+    # --------------------------------------------------------
+
+    parent_id = "root"
+
+    for folder_name in folders:
+
+        parent_id = ensure_sharepoint_folder(
+            drive_id=drive_id,
+            parent_id=parent_id,
+            folder_name=folder_name,
+            token=token
+        )
+
+    # --------------------------------------------------------
+    # DOWNLOAD ORIGINAL DMZ FILE
+    # --------------------------------------------------------
+
+    if properties.size > 250 * 1024 * 1024:
+        raise ValueError(
+            f"File exceeds 250 MB: {blob_name}. "
+            "Use a Graph upload session."
+        )
+
+    file_data = blob_client.download_blob(
+        etag=expected_etag,
+        match_condition=MatchConditions.IfNotModified
+    ).readall()
+
+    # --------------------------------------------------------
+    # UPLOAD FILE TO SHAREPOINT
+    # --------------------------------------------------------
+
+    encoded_file_name = quote(file_name, safe="")
 
     upload_url = (
-        "https://graph.microsoft.com/v1.0/"
-        f"drives/{drive_id}/root:/{encoded_path}:/content"
+        f"{GRAPH_BASE}/drives/{drive_id}"
+        f"/items/{parent_id}:/{encoded_file_name}:/content"
     )
 
     headers = {
-        "Authorization": f"Bearer {get_graph_token()}",
+        "Authorization": f"Bearer {token}",
         "Content-Type": "application/octet-stream"
     }
 
@@ -130,9 +497,9 @@ def upload_clean_blob_to_sharepoint(blob_name, dmz_credential):
     item = response.json()
 
     logging.info(
-        "SharePoint upload successful. File=%s ItemID=%s",
+        "Successfully uploaded %s to SharePoint: %s",
         blob_name,
-        item.get("id")
+        item.get("webUrl")
     )
 
     return item
@@ -152,7 +519,8 @@ def copy_blob(
     blob_name
 ):
     """
-    Copies a blob using the existing AzureStorageAccount class.
+    Copies a blob using the existing
+    AzureStorageAccount class.
     """
 
     response, _ = blob_class.TransferDirectoryFile_BlobtoBlob(
@@ -173,38 +541,35 @@ def copy_blob(
         )
 
     logging.info(
-        "Blob copy request successful: %s -> %s",
+        "Blob copy operation returned success: %s -> %s",
         blob_name,
         destination_container
     )
 
 
 # ============================================================
-# AZURE BLOB DELETE
+# DELETE DMZ BLOB
 # ============================================================
 
 def delete_dmz_blob(
-    blob_class,
     dmz_client,
-    blob_name
+    blob_name,
+    expected_etag
 ):
     """
-    Deletes the source file after all required
-    destinations have succeeded.
+    Deletes the original DMZ blob only if its ETag
+    still matches the Defender-scanned blob.
     """
 
-    response = blob_class.DeleteBlobs(
-        Blob_ServiceClient=dmz_client,
-        Blob_ContainerName=InterestedContainer,
-        Blob_FileDirectoryName=blob_name,
-        Exclusions=[],
-        Attempts=5
+    blob_client = dmz_client.get_blob_client(
+        container=InterestedContainer,
+        blob=blob_name
     )
 
-    if not 200 <= response["Code"] < 300:
-        raise RuntimeError(
-            f"Unable to delete DMZ blob {blob_name}: {response}"
-        )
+    blob_client.delete_blob(
+        etag=expected_etag,
+        match_condition=MatchConditions.IfNotModified
+    )
 
     logging.info(
         "Successfully deleted %s from DMZ",
@@ -219,7 +584,9 @@ def delete_dmz_blob(
 @app.event_grid_trigger(arg_name="azeventgrid")
 def MDScanner(azeventgrid: func.EventGridEvent):
 
-    logging.info("Python EventGrid trigger processed an event")
+    logging.info(
+        "Python EventGrid trigger processed an event"
+    )
 
     Blob_Class = AzureStorageAccount.StorageAccount()
 
@@ -247,11 +614,13 @@ def MDScanner(azeventgrid: func.EventGridEvent):
     # --------------------------------------------------------
 
     if EventGrid_EventType != AntimalwareScanEventType:
+
         logging.info(
             "Ignoring event %s. Unexpected event type: %s",
             EventGrid_ID,
             EventGrid_EventType
         )
+
         return
 
     # --------------------------------------------------------
@@ -266,15 +635,18 @@ def MDScanner(azeventgrid: func.EventGridEvent):
         or subject_parts[2] != "containers"
         or subject_parts[4] != "blobs"
     ):
-        logging.error(
-            "Unexpected Event Grid subject: %s",
-            azeventgrid.subject
+        raise ValueError(
+            f"Unexpected Event Grid subject: "
+            f"{azeventgrid.subject}"
         )
-        return
 
     StorageAccountName = subject_parts[1]
     ContainerName = subject_parts[3]
-    BlobName = "/".join(subject_parts[5:])
+
+    # Actual DMZ blob name
+    BlobName = unquote(
+        "/".join(subject_parts[5:])
+    )
 
     ScanResult = event_data.get("scanResultType")
 
@@ -291,34 +663,56 @@ def MDScanner(azeventgrid: func.EventGridEvent):
     # --------------------------------------------------------
 
     if ContainerName != InterestedContainer:
+
         logging.info(
             "Ignoring event %s from container %s",
             EventGrid_ID,
             ContainerName
         )
+
         return
 
     if StorageAccountName.lower() != "tsacstoragedmz":
+
         logging.warning(
             "Ignoring event from unexpected storage account: %s",
             StorageAccountName
         )
+
         return
 
     if not BlobName:
-        logging.error("Event %s has no blob name", EventGrid_ID)
-        return
+        raise ValueError("Event has no blob name")
 
-    if ScanResult not in (CleanVerdict, MaliciousVerdict):
+    if ScanResult not in (
+        CleanVerdict,
+        MaliciousVerdict
+    ):
+
         logging.warning(
             "Unexpected Defender scan result for %s: %s",
             BlobName,
             ScanResult
         )
+
         return
 
     # --------------------------------------------------------
-    # CONNECT TO AZURE STORAGE
+    # VERIFY SCANNED BLOB VERSION
+    # --------------------------------------------------------
+
+    expected_etag = event_data.get("blobETag")
+
+    if (
+        not isinstance(expected_etag, str)
+        or not expected_etag
+    ):
+        raise RuntimeError(
+            f"Defender event has no blobETag for {BlobName}"
+        )
+
+    # --------------------------------------------------------
+    # CONNECT TO DMZ STORAGE
     # --------------------------------------------------------
 
     Response_DMZ, DMZ_Blob_ServiceClient = (
@@ -330,7 +724,21 @@ def MDScanner(azeventgrid: func.EventGridEvent):
     )
 
     if not 200 <= Response_DMZ["Code"] < 300: # type: ignore
-        raise RuntimeError("Unable to connect to DMZ storage")
+        raise RuntimeError(
+            "Unable to connect to DMZ storage"
+        )
+
+    source_blob = DMZ_Blob_ServiceClient.get_blob_client( # type: ignore
+        container=InterestedContainer,
+        blob=BlobName
+    )
+
+    source_properties = source_blob.get_blob_properties()
+
+    if source_properties.etag != expected_etag:
+        raise RuntimeError(
+            f"DMZ blob changed since Defender scan: {BlobName}"
+        )
 
     # ========================================================
     # CLEAN FILE PROCESSING
@@ -352,6 +760,7 @@ def MDScanner(azeventgrid: func.EventGridEvent):
         # ----------------------------------------------------
 
         try:
+
             Response_Clean, Clean_Blob_ServiceClient = (
                 Blob_Class.ConnecttoBlobServiceClient(
                     StorageAccount_BlobURL=Clean_StorageAccount_URL,
@@ -378,6 +787,7 @@ def MDScanner(azeventgrid: func.EventGridEvent):
             storage_success = True
 
         except Exception:
+
             logging.exception(
                 "Azure Storage distribution failed for %s",
                 BlobName
@@ -388,14 +798,17 @@ def MDScanner(azeventgrid: func.EventGridEvent):
         # ----------------------------------------------------
 
         try:
+
             upload_clean_blob_to_sharepoint(
                 blob_name=BlobName,
-                dmz_credential=DMZ_Credential
+                dmz_credential=DMZ_Credential,
+                expected_etag=expected_etag
             )
 
             sharepoint_success = True
 
         except Exception:
+
             logging.exception(
                 "SharePoint distribution failed for %s",
                 BlobName
@@ -406,7 +819,8 @@ def MDScanner(azeventgrid: func.EventGridEvent):
         # ----------------------------------------------------
 
         logging.info(
-            "Distribution result for %s: Storage=%s SharePoint=%s",
+            "Distribution result for %s: "
+            "Storage=%s SharePoint=%s",
             BlobName,
             storage_success,
             sharepoint_success
@@ -414,15 +828,10 @@ def MDScanner(azeventgrid: func.EventGridEvent):
 
         if storage_success and sharepoint_success:
 
-            logging.info(
-                "Both destinations successful for %s",
-                BlobName
-            )
-
             delete_dmz_blob(
-                blob_class=Blob_Class,
                 dmz_client=DMZ_Blob_ServiceClient,
-                blob_name=BlobName
+                blob_name=BlobName,
+                expected_etag=expected_etag
             )
 
             logging.info(
@@ -431,7 +840,7 @@ def MDScanner(azeventgrid: func.EventGridEvent):
             )
 
         else:
-            # Keep the source so failed destinations can retry
+
             logging.error(
                 "Incomplete distribution for %s. "
                 "Original DMZ blob retained.",
@@ -455,7 +864,7 @@ def MDScanner(azeventgrid: func.EventGridEvent):
             BlobName
         )
 
-        # Copy to quarantine in the DMZ account
+        # Copy to quarantine
         copy_blob(
             blob_class=Blob_Class,
             origin_client=DMZ_Blob_ServiceClient,
@@ -466,19 +875,14 @@ def MDScanner(azeventgrid: func.EventGridEvent):
             blob_name=BlobName
         )
 
-        # Delete source only after successful quarantine
+        # Delete source after successful quarantine
         delete_dmz_blob(
-            blob_class=Blob_Class,
             dmz_client=DMZ_Blob_ServiceClient,
-            blob_name=BlobName
+            blob_name=BlobName,
+            expected_etag=expected_etag
         )
 
         logging.warning(
             "Malicious file quarantined successfully: %s",
             BlobName
         )
-
-        return
-    
-
-
